@@ -1,0 +1,201 @@
+// [COLUMN on FactESG]  Net profit per company-year ($M)
+Net Profit Row ($M) = FactESG[Revenue] * FactESG[ProfitMargin] / 100
+
+// [COLUMN on FactESG]  Carbon intensity per company-year (t CO2 per $M revenue)
+CI Row = DIVIDE ( FactESG[CarbonEmissions], FactESG[Revenue] )
+
+// [COLUMN on FactESG]  Optional: ESG score quartile
+ESG Quartile =
+VAR p25 = PERCENTILE.INC ( FactESG[ESG_Overall], 0.25 )
+VAR p50 = PERCENTILE.INC ( FactESG[ESG_Overall], 0.50 )
+VAR p75 = PERCENTILE.INC ( FactESG[ESG_Overall], 0.75 )
+RETURN
+    SWITCH (
+        TRUE (),
+        FactESG[ESG_Overall] <= p25, "Q1 · Low",
+        FactESG[ESG_Overall] <= p50, "Q2",
+        FactESG[ESG_Overall] <= p75, "Q3",
+        "Q4 · High"
+    )
+
+// [COLUMN on FactESG]  ESG blind spot flag (per year):
+// ESG score at or above the yearly median AND carbon intensity in the yearly top 25%
+ESG Blind Spot =
+VAR ciP75  = CALCULATE ( PERCENTILE.INC ( FactESG[CI Row], 0.75 ), ALLEXCEPT ( FactESG, FactESG[Year] ) )
+VAR esgMed = CALCULATE ( MEDIAN ( FactESG[ESG_Overall] ), ALLEXCEPT ( FactESG, FactESG[Year] ) )
+RETURN IF ( FactESG[ESG_Overall] >= esgMed && FactESG[CI Row] >= ciP75, 1, 0 )
+
+// [COLUMN on FactESG]  Legend label for the blind-spot scatter
+Blind Spot Label = IF ( FactESG[ESG Blind Spot] = 1, "Blind spot", "Other" )
+
+// [COLUMN on DimCompany]  Sector group from industry-level carbon intensity.
+// Result: Energy, Utilities, Transportation (intensity > ~500 t/$M) vs the other six (< ~300).
+// Any threshold between ~270 and ~570 gives the same grouping.
+Carbon Group =
+VAR ci =
+    CALCULATE (
+        DIVIDE ( SUM ( FactESG[CarbonEmissions] ), SUM ( FactESG[Revenue] ) ),
+        ALLEXCEPT ( DimCompany, DimCompany[Industry] )
+    )
+RETURN
+    IF ( ci >= 400, "High-carbon: Energy, Utilities, Transportation", "Other 6 industries" )
+
+Avg ESG             = AVERAGE ( FactESG[ESG_Overall] )
+Avg ESG E           = AVERAGE ( FactESG[ESG_Environmental] )
+Avg ESG S           = AVERAGE ( FactESG[ESG_Social] )
+Avg ESG G           = AVERAGE ( FactESG[ESG_Governance] )
+
+Avg Profit Margin   = AVERAGE ( FactESG[ProfitMargin] )
+Avg Growth          = AVERAGE ( FactESG[GrowthRate] )
+
+Total Revenue (T)   = DIVIDE ( SUM ( FactESG[Revenue] ), 1000000 )
+Avg Market Cap (B)  = DIVIDE ( AVERAGE ( FactESG[MarketCap] ), 1000 )
+
+Total CO2 (Bn t)    = DIVIDE ( SUM ( FactESG[CarbonEmissions] ), 1000000000 )
+Avg CO2 per Company = AVERAGE ( FactESG[CarbonEmissions] )
+
+Carbon Intensity    = DIVIDE ( SUM ( FactESG[CarbonEmissions] ), SUM ( FactESG[Revenue] ) )
+
+Company Count       = DISTINCTCOUNT ( FactESG[CompanyID] )
+
+Global Avg ESG      = CALCULATE ( [Avg ESG], ALL ( DimCompany ) )
+
+Avg CO2 YoY % =
+VAR y    = SELECTEDVALUE ( DimYear[Year] )
+VAR cur  = [Avg CO2 per Company]
+VAR prev = CALCULATE ( [Avg CO2 per Company], DimYear[Year] = y - 1 )
+RETURN
+    IF ( NOT ISBLANK ( y ) && NOT ISBLANK ( prev ), DIVIDE ( cur - prev, prev ) )
+
+Net Profit ($M)         = SUM ( FactESG[Net Profit Row ($M)] )
+
+// emissions (t) x price ($/t) / 1,000,000 = $ millions
+Carbon Cost ($M)        = SUM ( FactESG[CarbonEmissions] ) * [Carbon Price Value] / 1000000
+Carbon Cost ($B)        = DIVIDE ( [Carbon Cost ($M)], 1000 )
+
+Carbon-Adj Profit ($M)  = [Net Profit ($M)] - [Carbon Cost ($M)]
+
+Reported Margin %       = DIVIDE ( [Net Profit ($M)], SUM ( FactESG[Revenue] ) )
+Carbon-Adj Margin %     = DIVIDE ( [Carbon-Adj Profit ($M)], SUM ( FactESG[Revenue] ) )
+
+Margin Hit (pp)         = [Reported Margin %] - [Carbon-Adj Margin %]
+
+Loss-Making After Carbon % =
+VAR p = [Carbon Price Value]
+RETURN
+    DIVIDE (
+        COUNTROWS (
+            FILTER ( FactESG,
+                FactESG[Net Profit Row ($M)] - FactESG[CarbonEmissions] * p / 1000000 < 0 )
+        ),
+        COUNTROWS ( FactESG )
+    )
+
+Newly Loss-Making % =
+VAR p = [Carbon Price Value]
+RETURN
+    DIVIDE (
+        COUNTROWS (
+            FILTER ( FactESG,
+                FactESG[Net Profit Row ($M)] > 0
+                    && FactESG[Net Profit Row ($M)] - FactESG[CarbonEmissions] * p / 1000000 < 0 )
+        ),
+        COUNTROWS ( FactESG )
+    )
+
+Already Loss-Making % = [Loss-Making After Carbon %] - [Newly Loss-Making %]
+
+Stressed Market Cap ($M) =
+VAR p = [Carbon Price Value]
+RETURN
+    SUMX (
+        FactESG,
+        VAR np = FactESG[Net Profit Row ($M)]
+        VAR c  = FactESG[CarbonEmissions] * p / 1000000
+        RETURN
+            IF ( np > 0, FactESG[MarketCap] * MAX ( 0, 1 - DIVIDE ( c, np ) ), FactESG[MarketCap] )
+    )
+
+Valuation at Risk % =
+DIVIDE ( SUM ( FactESG[MarketCap] ) - [Stressed Market Cap ($M)], SUM ( FactESG[MarketCap] ) )
+
+Blind Spot Companies = SUM ( FactESG[ESG Blind Spot] )
+
+Avg Margin Volatility =
+AVERAGEX ( VALUES ( DimCompany[CompanyID] ), CALCULATE ( STDEV.S ( FactESG[ProfitMargin] ) ) )
+
+ESG Median (ref) = CALCULATE ( MEDIAN ( FactESG[ESG_Overall] ), ALL ( DimCompany ) )
+CI P75 (ref)     = CALCULATE ( PERCENTILE.INC ( FactESG[CI Row], 0.75 ), ALL ( DimCompany ) )
+
+Carbon Bill Label =
+FORMAT ( DIVIDE ( [Carbon Cost ($M)], [Net Profit ($M)] ), "0.0%" ) & " of total net profit"
+
+Margin Value Label =
+FORMAT ( [Reported Margin %], "0.0%" ) & " → " & FORMAT ( [Carbon-Adj Margin %], "0.0%" )
+
+Margin Change Label =
+"▼ −" & FORMAT ( [Margin Hit (pp)] * 100, "0.0" ) & " percentage points"
+
+Loss Label = FORMAT ( [Newly Loss-Making %], "0.0%" ) & " due to carbon"
+
+// Longer variant that also shows the companies already loss-making
+Loss Label (Full) =
+FORMAT ( [Already Loss-Making %], "0.0%" ) & " already + "
+    & FORMAT ( [Newly Loss-Making %], "0.0%" ) & " due to carbon"
+
+Blind Spot Subtitle =
+"Red = ESG ≥ " & FORMAT ( [ESG Median (ref)], "0" )
+    & " and carbon intensity in top 25% (≥ " & FORMAT ( [CI P75 (ref)], "#,0" ) & " t/$M)"
+
+Key Insight Stress =
+"At $" & [Carbon Price Value] & "/t, " & FORMAT ( [Loss-Making After Carbon %], "0%" )
+    & " of companies are loss-making and " & [Blind Spot Companies]
+    & " high-ESG companies stay exposed."
+
+Loss-Making @ Scale % =
+VAR p = MAX ( 'Price Scale'[Value] )
+RETURN
+    DIVIDE (
+        COUNTROWS (
+            FILTER ( FactESG,
+                FactESG[Net Profit Row ($M)] - FactESG[CarbonEmissions] * p / 1000000 < 0 )
+        ),
+        COUNTROWS ( FactESG )
+    )
+
+Market Cap at Risk @ Scale % =
+VAR p = MAX ( 'Price Scale'[Value] )
+VAR stressed =
+    SUMX (
+        FactESG,
+        VAR np = FactESG[Net Profit Row ($M)]
+        VAR c  = FactESG[CarbonEmissions] * p / 1000000
+        RETURN
+            IF ( np > 0, FactESG[MarketCap] * MAX ( 0, 1 - DIVIDE ( c, np ) ), FactESG[MarketCap] )
+    )
+RETURN
+    DIVIDE ( SUM ( FactESG[MarketCap] ) - stressed, SUM ( FactESG[MarketCap] ) )
+
+ESG Change (pts) =
+VAR y0 = MIN ( DimYear[Year] )
+VAR y1 = MAX ( DimYear[Year] )
+RETURN
+    CALCULATE ( [Avg ESG], DimYear[Year] = y1 ) - CALCULATE ( [Avg ESG], DimYear[Year] = y0 )
+
+CO2 per Company Change % =
+VAR y0 = MIN ( DimYear[Year] )
+VAR y1 = MAX ( DimYear[Year] )
+RETURN
+    DIVIDE (
+        CALCULATE ( [Avg CO2 per Company], DimYear[Year] = y1 ),
+        CALCULATE ( [Avg CO2 per Company], DimYear[Year] = y0 )
+    ) - 1
+
+Revenue Multiple =
+VAR y0 = MIN ( DimYear[Year] )
+VAR y1 = MAX ( DimYear[Year] )
+RETURN
+    DIVIDE (
+        CALCULATE ( AVERAGE ( FactESG[Revenue] ), DimYear[Year] = y1 ),
+        CALCULATE ( AVERAGE ( FactESG[Revenue] ), DimYear[Year] = y0 )
+    )
